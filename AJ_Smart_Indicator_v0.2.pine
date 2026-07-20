@@ -1,0 +1,192 @@
+//@version=6
+//==================================================================================================
+// AJ Smart Indicator v0.2
+// Original, non-repainting indicator for NIFTY and BANKNIFTY options decision support.
+// Signals are confirmed only at bar close. This is an indicator, not a strategy.
+//==================================================================================================
+indicator("AJ Smart Indicator v0.2", shorttitle = "AJ Smart v0.2", overlay = true)
+
+//==================================================================================================
+// VERSION & DISPLAY INPUTS
+//==================================================================================================
+string GROUP_DISPLAY = "Display"
+bool showTrendAverage = input.bool(true, "Show trend average", group = GROUP_DISPLAY)
+bool showTradeLevels = input.bool(true, "Show latest trade levels", group = GROUP_DISPLAY)
+bool showSwingMarkers = input.bool(false, "Show confirmed swing markers", group = GROUP_DISPLAY)
+
+//==================================================================================================
+// TREND ENGINE INPUTS
+//==================================================================================================
+string GROUP_TREND = "Trend Engine"
+int trendAverageLength = input.int(50, "EMA length", minval = 1, group = GROUP_TREND)
+float trendPriceSource = input.source(close, "Price source", group = GROUP_TREND)
+
+//==================================================================================================
+// SWING ENGINE INPUTS
+//==================================================================================================
+string GROUP_SWING = "Swing Engine"
+int swingLeftBars = input.int(3, "Pivot left bars", minval = 1, group = GROUP_SWING)
+int swingRightBars = input.int(3, "Pivot right bars", minval = 1, group = GROUP_SWING)
+
+//==================================================================================================
+// ATR ENGINE INPUTS
+//==================================================================================================
+string GROUP_ATR = "ATR Engine"
+int atrLength = input.int(14, "ATR length", minval = 1, group = GROUP_ATR)
+float strongCandleAtrMultiplier = input.float(0.80, "Minimum body in ATR", minval = 0.01, step = 0.01, group = GROUP_ATR)
+float minimumBodyPercent = input.float(60.0, "Minimum body as % of range", minval = 1.0, maxval = 100.0, step = 1.0, group = GROUP_ATR)
+float closeLocationPercent = input.float(70.0, "Close location threshold %", minval = 50.0, maxval = 100.0, step = 1.0, group = GROUP_ATR)
+
+//==================================================================================================
+// RISK ENGINE INPUTS
+//==================================================================================================
+string GROUP_RISK = "Risk Engine"
+float atrStopMultiplier = input.float(1.50, "ATR stop multiplier", minval = 0.01, step = 0.01, group = GROUP_RISK)
+float swingStopAtrBuffer = input.float(0.25, "Swing-stop ATR buffer", minval = 0.0, step = 0.01, group = GROUP_RISK)
+float targetOneRiskReward = input.float(1.00, "Target 1 risk-reward", minval = 0.10, step = 0.10, group = GROUP_RISK)
+float targetTwoRiskReward = input.float(2.00, "Target 2 risk-reward", minval = 0.10, step = 0.10, group = GROUP_RISK)
+
+//==================================================================================================
+// ENTRY ENGINE INPUTS
+//==================================================================================================
+string GROUP_ENTRY = "Entry Engine"
+bool requireTrendAlignment = input.bool(true, "Require EMA trend alignment", group = GROUP_ENTRY)
+
+//==================================================================================================
+// Function : calculateCandleRange()
+// Purpose  : Returns a safe high-to-low candle range for ratio calculations.
+// Returns  : float
+//==================================================================================================
+calculateCandleRange(float candleHigh, float candleLow) =>
+    math.max(candleHigh - candleLow, syminfo.mintick)
+
+//==================================================================================================
+// Function : calculateClosePosition()
+// Purpose  : Returns the close position within a candle range as a percentage.
+// Returns  : float
+//==================================================================================================
+calculateClosePosition(float candleClose, float candleLow, float candleRange) =>
+    ((candleClose - candleLow) / candleRange) * 100.0
+
+//==================================================================================================
+// Function : calculateLongStopLoss()
+// Purpose  : Selects the more protective of ATR and confirmed-swing stops for a long trade.
+// Returns  : float
+//==================================================================================================
+calculateLongStopLoss(float tradeEntryPrice, float currentAtr, float confirmedSwingLow) =>
+    float atrStopLoss = tradeEntryPrice - (currentAtr * atrStopMultiplier)
+    float swingStopLoss = na(confirmedSwingLow) ? atrStopLoss : confirmedSwingLow - (currentAtr * swingStopAtrBuffer)
+    math.min(atrStopLoss, swingStopLoss)
+
+//==================================================================================================
+// Function : calculateShortStopLoss()
+// Purpose  : Selects the more protective of ATR and confirmed-swing stops for a short trade.
+// Returns  : float
+//==================================================================================================
+calculateShortStopLoss(float tradeEntryPrice, float currentAtr, float confirmedSwingHigh) =>
+    float atrStopLoss = tradeEntryPrice + (currentAtr * atrStopMultiplier)
+    float swingStopLoss = na(confirmedSwingHigh) ? atrStopLoss : confirmedSwingHigh + (currentAtr * swingStopAtrBuffer)
+    math.max(atrStopLoss, swingStopLoss)
+
+//==================================================================================================
+// Function : calculateLongTarget()
+// Purpose  : Calculates a long target from the defined risk-reward multiple.
+// Returns  : float
+//==================================================================================================
+calculateLongTarget(float tradeEntryPrice, float tradeStopLoss, float riskRewardMultiple) =>
+    tradeEntryPrice + ((tradeEntryPrice - tradeStopLoss) * riskRewardMultiple)
+
+//==================================================================================================
+// Function : calculateShortTarget()
+// Purpose  : Calculates a short target from the defined risk-reward multiple.
+// Returns  : float
+//==================================================================================================
+calculateShortTarget(float tradeEntryPrice, float tradeStopLoss, float riskRewardMultiple) =>
+    tradeEntryPrice - ((tradeStopLoss - tradeEntryPrice) * riskRewardMultiple)
+
+//==================================================================================================
+// TREND ENGINE
+//==================================================================================================
+float trendAverage = ta.ema(trendPriceSource, trendAverageLength)
+bool bullTrend = close > trendAverage
+bool bearTrend = close < trendAverage
+color trendColor = bullTrend ? color.teal : bearTrend ? color.maroon : color.gray
+
+//==================================================================================================
+// SWING ENGINE
+// Pivot values are known only after swingRightBars have elapsed; no future-bar data is used.
+//==================================================================================================
+float pivotHigh = ta.pivothigh(high, swingLeftBars, swingRightBars)
+float pivotLow = ta.pivotlow(low, swingLeftBars, swingRightBars)
+var float lastConfirmedSwingHigh = na
+var float lastConfirmedSwingLow = na
+
+if barstate.isconfirmed
+    if not na(pivotHigh)
+        lastConfirmedSwingHigh := pivotHigh
+    if not na(pivotLow)
+        lastConfirmedSwingLow := pivotLow
+
+//==================================================================================================
+// ATR ENGINE & STRONG CANDLE FILTER
+//==================================================================================================
+float currentAtr = ta.atr(atrLength)
+float candleRange = calculateCandleRange(high, low)
+float candleBody = math.abs(close - open)
+float candleBodyPercent = (candleBody / candleRange) * 100.0
+float candleClosePosition = calculateClosePosition(close, low, candleRange)
+bool isBullishCandle = close > open
+bool isBearishCandle = close < open
+bool hasRequiredBodySize = candleBody >= currentAtr * strongCandleAtrMultiplier
+bool hasRequiredBodyPercent = candleBodyPercent >= minimumBodyPercent
+bool strongBullishCandle = isBullishCandle and hasRequiredBodySize and hasRequiredBodyPercent and candleClosePosition >= closeLocationPercent
+bool strongBearishCandle = isBearishCandle and hasRequiredBodySize and hasRequiredBodyPercent and candleClosePosition <= 100.0 - closeLocationPercent
+
+//==================================================================================================
+// ENTRY ENGINE
+// Signals are gated by barstate.isconfirmed so a live bar cannot create a repainting signal.
+//==================================================================================================
+bool longTrendPass = not requireTrendAlignment or bullTrend
+bool shortTrendPass = not requireTrendAlignment or bearTrend
+bool longSignal = barstate.isconfirmed and strongBullishCandle and longTrendPass
+bool shortSignal = barstate.isconfirmed and strongBearishCandle and shortTrendPass
+
+//==================================================================================================
+// RISK ENGINE
+// Keeps the latest confirmed setup levels visible until a later confirmed setup replaces them.
+//==================================================================================================
+var float activeEntryPrice = na
+var float activeStopLoss = na
+var float activeTargetOne = na
+var float activeTargetTwo = na
+
+if longSignal
+    activeEntryPrice := close
+    activeStopLoss := calculateLongStopLoss(activeEntryPrice, currentAtr, lastConfirmedSwingLow)
+    activeTargetOne := calculateLongTarget(activeEntryPrice, activeStopLoss, targetOneRiskReward)
+    activeTargetTwo := calculateLongTarget(activeEntryPrice, activeStopLoss, targetTwoRiskReward)
+else if shortSignal
+    activeEntryPrice := close
+    activeStopLoss := calculateShortStopLoss(activeEntryPrice, currentAtr, lastConfirmedSwingHigh)
+    activeTargetOne := calculateShortTarget(activeEntryPrice, activeStopLoss, targetOneRiskReward)
+    activeTargetTwo := calculateShortTarget(activeEntryPrice, activeStopLoss, targetTwoRiskReward)
+
+//==================================================================================================
+// DRAWING ENGINE
+//==================================================================================================
+plot(showTrendAverage ? trendAverage : na, "Trend EMA", color = trendColor, linewidth = 2)
+plot(showTradeLevels ? activeEntryPrice : na, "Entry", color = color.blue, linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels ? activeStopLoss : na, "Hybrid Stop Loss", color = color.red, linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels ? activeTargetOne : na, "Target 1", color = color.green, linewidth = 1, style = plot.style_linebr)
+plot(showTradeLevels ? activeTargetTwo : na, "Target 2", color = color.lime, linewidth = 2, style = plot.style_linebr)
+plotshape(longSignal, title = "Bullish setup", style = shape.triangleup, location = location.belowbar, color = color.teal, size = size.tiny)
+plotshape(shortSignal, title = "Bearish setup", style = shape.triangledown, location = location.abovebar, color = color.maroon, size = size.tiny)
+plotshape(showSwingMarkers and not na(pivotHigh), title = "Confirmed swing high", style = shape.circle, location = location.abovebar, color = color.orange, size = size.tiny)
+plotshape(showSwingMarkers and not na(pivotLow), title = "Confirmed swing low", style = shape.circle, location = location.belowbar, color = color.aqua, size = size.tiny)
+
+//==================================================================================================
+// ALERT ENGINE
+// Alerts trigger only for completed candles and expose the setup direction to TradingView.
+//==================================================================================================
+alertcondition(longSignal, title = "AJ Smart v0.2 Long Setup", message = "AJ Smart v0.2: confirmed bullish setup on {{ticker}} at {{close}}.")
+alertcondition(shortSignal, title = "AJ Smart v0.2 Short Setup", message = "AJ Smart v0.2: confirmed bearish setup on {{ticker}} at {{close}}.")
