@@ -1,0 +1,537 @@
+//@version=6
+//==================================================================================================
+// AJ Smart Indicator v0.4.0
+// Original, non-repainting indicator for NIFTY and BANKNIFTY options decision support.
+//==================================================================================================
+indicator("AJ Smart Indicator v0.4.0", shorttitle = "AJ Smart", overlay = true, max_lines_count = 4)
+//==================================================================================================
+// DISPLAY INPUTS
+//==================================================================================================
+string GROUP_DISPLAY = "Display"
+
+bool showTrendAverage = input.bool(true, "Show trend average", group = GROUP_DISPLAY)
+
+bool showTradeLevels = input.bool(true, "Show latest trade levels", group = GROUP_DISPLAY)
+
+bool showVWAP = input.bool(true, "Show VWAP", group = GROUP_DISPLAY)
+
+//==================================================================================================
+// TREND ENGINE INPUTS
+//==================================================================================================
+string GROUP_TREND = "Trend Engine"
+int trendAverageLength = input.int(50, "EMA length", minval = 1, group = GROUP_TREND)
+float trendPriceSource = input.source(close, "Price source", group = GROUP_TREND)
+
+//==================================================================================================
+// SWING ENGINE INPUTS
+//==================================================================================================
+string GROUP_SWING = "Swing Engine"
+int swingLeftBars = input.int(3, "Pivot left bars", minval = 1, group = GROUP_SWING)
+int swingRightBars = input.int(3, "Pivot right bars", minval = 1, group = GROUP_SWING)
+
+//==================================================================================================
+// ATR ENGINE INPUTS
+//==================================================================================================
+string GROUP_ATR = "ATR Engine"
+int atrLength = input.int(14, "ATR length", minval = 1, group = GROUP_ATR)
+float strongCandleAtrMultiplier = input.float(0.80, "Minimum body in ATR", minval = 0.01, step = 0.01, group = GROUP_ATR)
+float minimumBodyPercent = input.float(60.0, "Minimum body as % of range", minval = 1.0, maxval = 100.0, step = 1.0, group = GROUP_ATR)
+float closeLocationPercent = input.float(70.0, "Close location threshold %", minval = 50.0, maxval = 100.0, step = 1.0, group = GROUP_ATR)
+
+//==================================================================================================
+// RISK ENGINE INPUTS
+//==================================================================================================
+string GROUP_RISK = "Risk Engine"
+float atrStopMultiplier = input.float(1.50, "ATR stop multiplier", minval = 0.01, step = 0.01, group = GROUP_RISK)
+float swingStopAtrBuffer = input.float(0.25, "Swing-stop ATR buffer", minval = 0.0, step = 0.01, group = GROUP_RISK)
+float targetOneRiskReward = input.float(1.00, "Target 1 risk-reward", minval = 0.10, step = 0.10, group = GROUP_RISK)
+float targetTwoRiskReward = input.float(2.00, "Target 2 risk-reward", minval = 0.10, step = 0.10, group = GROUP_RISK)
+
+//==================================================================================================
+// ENTRY ENGINE INPUTS
+//==================================================================================================
+string GROUP_ENTRY = "Entry Engine"
+bool requireTrendAlignment = input.bool(true, "Require EMA trend alignment", group = GROUP_ENTRY)
+
+//==================================================================================================
+// FILTER INPUTS
+//==================================================================================================
+string GROUP_FILTER = "Filters"
+
+bool enableVolumeFilter = input.bool(true, "Enable Volume Filter", group = GROUP_FILTER)
+
+int volumeLength = input.int(20, "Volume SMA Length", minval = 1, group = GROUP_FILTER)
+
+float volumeMultiplier = input.float(1.20, "Volume Multiplier", step = 0.05, group = GROUP_FILTER)
+
+bool enableVWAPFilter = input.bool(true, "Enable VWAP Filter", group = GROUP_FILTER)
+
+//==================================================================================================
+// Function : getSafeCandleRange()
+// Purpose  : Returns a non-zero candle range for percentage calculations.
+// Returns  : float
+//==================================================================================================
+getSafeCandleRange(float candleHigh, float candleLow) =>
+    math.max(candleHigh - candleLow, syminfo.mintick)
+
+//==================================================================================================
+// Function : getClosePositionPercent()
+// Purpose  : Returns the close location within a candle's range as a percentage.
+// Returns  : float
+//==================================================================================================
+getClosePositionPercent(float candleClose, float candleLow, float safeCandleRange) =>
+    ((candleClose - candleLow) / safeCandleRange) * 100.0
+
+//==================================================================================================
+// Function : getLongHybridStopLoss()
+// Purpose  : Returns the lower of the ATR stop and buffered confirmed-swing stop.
+// Returns  : float
+//==================================================================================================
+getLongHybridStopLoss(float entryPrice, float atrValue, float confirmedSwingLow) =>
+    float atrBasedStopLoss = entryPrice - (atrValue * atrStopMultiplier)
+    float swingBasedStopLoss = na(confirmedSwingLow) ? atrBasedStopLoss : confirmedSwingLow - (atrValue * swingStopAtrBuffer)
+    math.min(atrBasedStopLoss, swingBasedStopLoss)
+
+//==================================================================================================
+// Function : getShortHybridStopLoss()
+// Purpose  : Returns the higher of the ATR stop and buffered confirmed-swing stop.
+// Returns  : float
+//==================================================================================================
+getShortHybridStopLoss(float entryPrice, float atrValue, float confirmedSwingHigh) =>
+    float atrBasedStopLoss = entryPrice + (atrValue * atrStopMultiplier)
+    float swingBasedStopLoss = na(confirmedSwingHigh) ? atrBasedStopLoss : confirmedSwingHigh + (atrValue * swingStopAtrBuffer)
+    math.max(atrBasedStopLoss, swingBasedStopLoss)
+
+//==================================================================================================
+// Function : getLongTargetPrice()
+// Purpose  : Calculates a long target from entry, stop loss, and risk-reward multiple.
+// Returns  : float
+//==================================================================================================
+getLongTargetPrice(float entryPrice, float stopLossPrice, float riskRewardMultiple) =>
+    entryPrice + ((entryPrice - stopLossPrice) * riskRewardMultiple)
+
+//==================================================================================================
+// Function : getShortTargetPrice()
+// Purpose  : Calculates a short target from entry, stop loss, and risk-reward multiple.
+// Returns  : float
+//==================================================================================================
+getShortTargetPrice(float entryPrice, float stopLossPrice, float riskRewardMultiple) =>
+    entryPrice - ((stopLossPrice - entryPrice) * riskRewardMultiple)
+
+//==================================================================================================
+// Function : deleteLineIfPresent()
+// Purpose  : Deletes an existing active-trade line when its handle is valid.
+// Returns  : void
+//==================================================================================================
+deleteLineIfPresent(line lineId) =>
+    if not na(lineId)
+        line.delete(lineId)
+
+//==================================================================================================
+// Function : deleteActiveTradeLines()
+// Purpose  : Removes the prior active trade's four frozen level lines.
+// Returns  : void
+//==================================================================================================
+deleteActiveTradeLines(line entryLine, line stopLossLine, line targetOneLine, line targetTwoLine) =>
+    deleteLineIfPresent(entryLine)
+    deleteLineIfPresent(stopLossLine)
+    deleteLineIfPresent(targetOneLine)
+    deleteLineIfPresent(targetTwoLine)
+
+//==================================================================================================
+// Function : createFrozenTradeLine()
+// Purpose  : Creates a fixed-price, right-extending line from a confirmed signal candle.
+// Returns  : line
+//==================================================================================================
+createFrozenTradeLine(int signalBarIndex, float frozenPrice, color lineColor, int lineWidth) =>
+    line.new(x1 = signalBarIndex, y1 = frozenPrice, x2 = signalBarIndex + 1, y2 = frozenPrice, xloc = xloc.bar_index, extend = extend.right, color = lineColor, width = lineWidth)
+
+//==================================================================================================
+// TREND ENGINE
+//==================================================================================================
+float trendEma = ta.ema(trendPriceSource, trendAverageLength)
+bool isBullTrend = close > trendEma
+bool isBearTrend = close < trendEma
+color trendEmaColor = isBullTrend ? color.teal : isBearTrend ? color.maroon : color.gray
+
+//==================================================================================================
+// SWING ENGINE
+//==================================================================================================
+float confirmedPivotHigh = ta.pivothigh(high, swingLeftBars, swingRightBars)
+float confirmedPivotLow = ta.pivotlow(low, swingLeftBars, swingRightBars)
+var float latestConfirmedSwingHigh = na
+var float latestConfirmedSwingLow = na
+
+if barstate.isconfirmed
+    if not na(confirmedPivotHigh)
+        latestConfirmedSwingHigh := confirmedPivotHigh
+    if not na(confirmedPivotLow)
+        latestConfirmedSwingLow := confirmedPivotLow
+
+//==================================================================================================
+// ATR ENGINE & STRONG CANDLE FILTER
+//==================================================================================================
+float atrValue = ta.atr(atrLength)
+float safeCandleRange = getSafeCandleRange(high, low)
+float candleBodySize = math.abs(close - open)
+float candleBodyPercent = (candleBodySize / safeCandleRange) * 100.0
+float closePositionPercent = getClosePositionPercent(close, low, safeCandleRange)
+bool isBullishCandle = close > open
+bool isBearishCandle = close < open
+bool meetsAtrBodyRequirement = candleBodySize >= atrValue * strongCandleAtrMultiplier
+bool meetsBodyPercentRequirement = candleBodyPercent >= minimumBodyPercent
+bool isStrongBullishCandle = isBullishCandle and meetsAtrBodyRequirement and meetsBodyPercentRequirement and closePositionPercent >= closeLocationPercent
+bool isStrongBearishCandle = isBearishCandle and meetsAtrBodyRequirement and meetsBodyPercentRequirement and closePositionPercent <= 100.0 - closeLocationPercent
+
+//==================================================================================================
+// VWAP ENGINE
+//==================================================================================================
+float currentVWAP = ta.vwap(close)
+
+bool passesLongVWAPFilter = not enableVWAPFilter or close > currentVWAP
+
+bool passesShortVWAPFilter = not enableVWAPFilter or close < currentVWAP
+
+//==================================================================================================
+// ENTRY ENGINE
+//==================================================================================================
+bool passesLongTrendFilter = not requireTrendAlignment or isBullTrend
+bool passesShortTrendFilter = not requireTrendAlignment or isBearTrend
+
+float volumeAverage = ta.sma(volume, volumeLength)
+bool passesVolumeFilter = not enableVolumeFilter or volume > volumeAverage * volumeMultiplier
+
+bool confirmedLongSignal = barstate.isconfirmed and isStrongBullishCandle and passesLongTrendFilter and passesVolumeFilter and passesLongVWAPFilter
+bool confirmedShortSignal = barstate.isconfirmed and isStrongBearishCandle and passesShortTrendFilter and passesVolumeFilter and passesShortVWAPFilter
+
+//==================================================================================================
+// RISK ENGINE
+// Frozen prices are assigned only when a new confirmed signal occurs.
+//==================================================================================================
+var float frozenEntryPrice = na
+var float frozenStopLoss = na
+var float frozenTargetOne = na
+var float frozenTargetTwo = na
+
+if confirmedLongSignal
+    frozenEntryPrice := close
+    frozenStopLoss := getLongHybridStopLoss(frozenEntryPrice, atrValue, latestConfirmedSwingLow)
+    frozenTargetOne := getLongTargetPrice(frozenEntryPrice, frozenStopLoss, targetOneRiskReward)
+    frozenTargetTwo := getLongTargetPrice(frozenEntryPrice, frozenStopLoss, targetTwoRiskReward)
+else if confirmedShortSignal
+    frozenEntryPrice := close
+    frozenStopLoss := getShortHybridStopLoss(frozenEntryPrice, atrValue, latestConfirmedSwingHigh)
+    frozenTargetOne := getShortTargetPrice(frozenEntryPrice, frozenStopLoss, targetOneRiskReward)
+    frozenTargetTwo := getShortTargetPrice(frozenEntryPrice, frozenStopLoss, targetTwoRiskReward)
+
+//==================================================================================================
+// DRAWING ENGINE
+// Markers use TradingView candle-relative placement. Level objects are created and replaced only
+// on a confirmed signal; their prices and endpoints are never modified on later candles.
+//==================================================================================================
+var line activeEntryLine = na
+var line activeStopLossLine = na
+var line activeTargetOneLine = na
+var line activeTargetTwoLine = na
+
+plotshape(confirmedLongSignal, title = "BUY", style = shape.triangleup, location = location.belowbar, color = color.teal, text = "BUY", textcolor = color.white, size = size.small)
+plotshape(confirmedShortSignal, title = "SELL", style = shape.triangledown, location = location.abovebar, color = color.maroon, text = "SELL", textcolor = color.white, size = size.small)
+
+if confirmedLongSignal or confirmedShortSignal
+    if showTradeLevels
+        deleteActiveTradeLines(activeEntryLine, activeStopLossLine, activeTargetOneLine, activeTargetTwoLine)
+        activeEntryLine := createFrozenTradeLine(bar_index, frozenEntryPrice,  color.blue, 2)
+        activeStopLossLine := createFrozenTradeLine(bar_index, frozenStopLoss, color.red, 2)
+        activeTargetOneLine := createFrozenTradeLine(bar_index, frozenTargetOne, color.green, 1)
+        activeTargetTwoLine := createFrozenTradeLine(bar_index, frozenTargetTwo, color.lime, 2)
+
+//==================================================================================================
+// RETAINED INDICATOR VISUALS
+//==================================================================================================
+plot(
+    showTrendAverage ? trendEma : na,
+    "Trend EMA",
+    color = trendEmaColor,
+    linewidth = 2)
+
+plot(
+    showVWAP ? currentVWAP : na,
+    "VWAP",
+    color = color.blue,
+//@version=6
+//==================================================================================================
+// AJ Smart Indicator v0.4.0
+// Original, non-repainting indicator for NIFTY and BANKNIFTY options decision support.
+//==================================================================================================
+indicator("AJ Smart Indicator v0.4.0", shorttitle = "AJ Smart", overlay = true, max_lines_count = 4)
+//==================================================================================================
+// DISPLAY INPUTS
+//==================================================================================================
+string GROUP_DISPLAY = "Display"
+
+bool showTrendAverage = input.bool(true, "Show trend average", group = GROUP_DISPLAY)
+
+bool showTradeLevels = input.bool(true, "Show latest trade levels", group = GROUP_DISPLAY)
+
+bool showVWAP = input.bool(true, "Show VWAP", group = GROUP_DISPLAY)
+
+//==================================================================================================
+// TREND ENGINE INPUTS
+//==================================================================================================
+string GROUP_TREND = "Trend Engine"
+int trendAverageLength = input.int(50, "EMA length", minval = 1, group = GROUP_TREND)
+float trendPriceSource = input.source(close, "Price source", group = GROUP_TREND)
+
+//==================================================================================================
+// SWING ENGINE INPUTS
+//==================================================================================================
+string GROUP_SWING = "Swing Engine"
+int swingLeftBars = input.int(3, "Pivot left bars", minval = 1, group = GROUP_SWING)
+int swingRightBars = input.int(3, "Pivot right bars", minval = 1, group = GROUP_SWING)
+
+//==================================================================================================
+// ATR ENGINE INPUTS
+//==================================================================================================
+string GROUP_ATR = "ATR Engine"
+int atrLength = input.int(14, "ATR length", minval = 1, group = GROUP_ATR)
+float strongCandleAtrMultiplier = input.float(0.80, "Minimum body in ATR", minval = 0.01, step = 0.01, group = GROUP_ATR)
+float minimumBodyPercent = input.float(60.0, "Minimum body as % of range", minval = 1.0, maxval = 100.0, step = 1.0, group = GROUP_ATR)
+float closeLocationPercent = input.float(70.0, "Close location threshold %", minval = 50.0, maxval = 100.0, step = 1.0, group = GROUP_ATR)
+
+//==================================================================================================
+// RISK ENGINE INPUTS
+//==================================================================================================
+string GROUP_RISK = "Risk Engine"
+float atrStopMultiplier = input.float(1.50, "ATR stop multiplier", minval = 0.01, step = 0.01, group = GROUP_RISK)
+float swingStopAtrBuffer = input.float(0.25, "Swing-stop ATR buffer", minval = 0.0, step = 0.01, group = GROUP_RISK)
+float targetOneRiskReward = input.float(1.00, "Target 1 risk-reward", minval = 0.10, step = 0.10, group = GROUP_RISK)
+float targetTwoRiskReward = input.float(2.00, "Target 2 risk-reward", minval = 0.10, step = 0.10, group = GROUP_RISK)
+
+//==================================================================================================
+// ENTRY ENGINE INPUTS
+//==================================================================================================
+string GROUP_ENTRY = "Entry Engine"
+bool requireTrendAlignment = input.bool(true, "Require EMA trend alignment", group = GROUP_ENTRY)
+
+//==================================================================================================
+// FILTER INPUTS
+//==================================================================================================
+string GROUP_FILTER = "Filters"
+
+bool enableVolumeFilter = input.bool(true, "Enable Volume Filter", group = GROUP_FILTER)
+
+int volumeLength = input.int(20, "Volume SMA Length", minval = 1, group = GROUP_FILTER)
+
+float volumeMultiplier = input.float(1.20, "Volume Multiplier", step = 0.05, group = GROUP_FILTER)
+
+bool enableVWAPFilter = input.bool(true, "Enable VWAP Filter", group = GROUP_FILTER)
+
+//==================================================================================================
+// Function : getSafeCandleRange()
+// Purpose  : Returns a non-zero candle range for percentage calculations.
+// Returns  : float
+//==================================================================================================
+getSafeCandleRange(float candleHigh, float candleLow) =>
+    math.max(candleHigh - candleLow, syminfo.mintick)
+
+//==================================================================================================
+// Function : getClosePositionPercent()
+// Purpose  : Returns the close location within a candle's range as a percentage.
+// Returns  : float
+//==================================================================================================
+getClosePositionPercent(float candleClose, float candleLow, float safeCandleRange) =>
+    ((candleClose - candleLow) / safeCandleRange) * 100.0
+
+//==================================================================================================
+// Function : getLongHybridStopLoss()
+// Purpose  : Returns the lower of the ATR stop and buffered confirmed-swing stop.
+// Returns  : float
+//==================================================================================================
+getLongHybridStopLoss(float entryPrice, float atrValue, float confirmedSwingLow) =>
+    float atrBasedStopLoss = entryPrice - (atrValue * atrStopMultiplier)
+    float swingBasedStopLoss = na(confirmedSwingLow) ? atrBasedStopLoss : confirmedSwingLow - (atrValue * swingStopAtrBuffer)
+    math.min(atrBasedStopLoss, swingBasedStopLoss)
+
+//==================================================================================================
+// Function : getShortHybridStopLoss()
+// Purpose  : Returns the higher of the ATR stop and buffered confirmed-swing stop.
+// Returns  : float
+//==================================================================================================
+getShortHybridStopLoss(float entryPrice, float atrValue, float confirmedSwingHigh) =>
+    float atrBasedStopLoss = entryPrice + (atrValue * atrStopMultiplier)
+    float swingBasedStopLoss = na(confirmedSwingHigh) ? atrBasedStopLoss : confirmedSwingHigh + (atrValue * swingStopAtrBuffer)
+    math.max(atrBasedStopLoss, swingBasedStopLoss)
+
+//==================================================================================================
+// Function : getLongTargetPrice()
+// Purpose  : Calculates a long target from entry, stop loss, and risk-reward multiple.
+// Returns  : float
+//==================================================================================================
+getLongTargetPrice(float entryPrice, float stopLossPrice, float riskRewardMultiple) =>
+    entryPrice + ((entryPrice - stopLossPrice) * riskRewardMultiple)
+
+//==================================================================================================
+// Function : getShortTargetPrice()
+// Purpose  : Calculates a short target from entry, stop loss, and risk-reward multiple.
+// Returns  : float
+//==================================================================================================
+getShortTargetPrice(float entryPrice, float stopLossPrice, float riskRewardMultiple) =>
+    entryPrice - ((stopLossPrice - entryPrice) * riskRewardMultiple)
+
+//==================================================================================================
+// Function : deleteLineIfPresent()
+// Purpose  : Deletes an existing active-trade line when its handle is valid.
+// Returns  : void
+//==================================================================================================
+deleteLineIfPresent(line lineId) =>
+    if not na(lineId)
+        line.delete(lineId)
+
+//==================================================================================================
+// Function : deleteActiveTradeLines()
+// Purpose  : Removes the prior active trade's four frozen level lines.
+// Returns  : void
+//==================================================================================================
+deleteActiveTradeLines(line entryLine, line stopLossLine, line targetOneLine, line targetTwoLine) =>
+    deleteLineIfPresent(entryLine)
+    deleteLineIfPresent(stopLossLine)
+    deleteLineIfPresent(targetOneLine)
+    deleteLineIfPresent(targetTwoLine)
+
+//==================================================================================================
+// Function : createFrozenTradeLine()
+// Purpose  : Creates a fixed-price, right-extending line from a confirmed signal candle.
+// Returns  : line
+//==================================================================================================
+createFrozenTradeLine(int signalBarIndex, float frozenPrice, color lineColor, int lineWidth) =>
+    line.new(x1 = signalBarIndex, y1 = frozenPrice, x2 = signalBarIndex + 1, y2 = frozenPrice, xloc = xloc.bar_index, extend = extend.right, color = lineColor, width = lineWidth)
+
+//==================================================================================================
+// TREND ENGINE
+//==================================================================================================
+float trendEma = ta.ema(trendPriceSource, trendAverageLength)
+bool isBullTrend = close > trendEma
+bool isBearTrend = close < trendEma
+color trendEmaColor = isBullTrend ? color.teal : isBearTrend ? color.maroon : color.gray
+
+//==================================================================================================
+// SWING ENGINE
+//==================================================================================================
+float confirmedPivotHigh = ta.pivothigh(high, swingLeftBars, swingRightBars)
+float confirmedPivotLow = ta.pivotlow(low, swingLeftBars, swingRightBars)
+var float latestConfirmedSwingHigh = na
+var float latestConfirmedSwingLow = na
+
+if barstate.isconfirmed
+    if not na(confirmedPivotHigh)
+        latestConfirmedSwingHigh := confirmedPivotHigh
+    if not na(confirmedPivotLow)
+        latestConfirmedSwingLow := confirmedPivotLow
+
+//==================================================================================================
+// ATR ENGINE & STRONG CANDLE FILTER
+//==================================================================================================
+float atrValue = ta.atr(atrLength)
+float safeCandleRange = getSafeCandleRange(high, low)
+float candleBodySize = math.abs(close - open)
+float candleBodyPercent = (candleBodySize / safeCandleRange) * 100.0
+float closePositionPercent = getClosePositionPercent(close, low, safeCandleRange)
+bool isBullishCandle = close > open
+bool isBearishCandle = close < open
+bool meetsAtrBodyRequirement = candleBodySize >= atrValue * strongCandleAtrMultiplier
+bool meetsBodyPercentRequirement = candleBodyPercent >= minimumBodyPercent
+bool isStrongBullishCandle = isBullishCandle and meetsAtrBodyRequirement and meetsBodyPercentRequirement and closePositionPercent >= closeLocationPercent
+bool isStrongBearishCandle = isBearishCandle and meetsAtrBodyRequirement and meetsBodyPercentRequirement and closePositionPercent <= 100.0 - closeLocationPercent
+
+//==================================================================================================
+// VWAP ENGINE
+//==================================================================================================
+float currentVWAP = ta.vwap(close)
+
+bool passesLongVWAPFilter = not enableVWAPFilter or close > currentVWAP
+
+bool passesShortVWAPFilter = not enableVWAPFilter or close < currentVWAP
+
+//==================================================================================================
+// ENTRY ENGINE
+//==================================================================================================
+bool passesLongTrendFilter = not requireTrendAlignment or isBullTrend
+bool passesShortTrendFilter = not requireTrendAlignment or isBearTrend
+
+float volumeAverage = ta.sma(volume, volumeLength)
+bool passesVolumeFilter = not enableVolumeFilter or volume > volumeAverage * volumeMultiplier
+
+bool confirmedLongSignal = barstate.isconfirmed and isStrongBullishCandle and passesLongTrendFilter and passesVolumeFilter and passesLongVWAPFilter
+bool confirmedShortSignal = barstate.isconfirmed and isStrongBearishCandle and passesShortTrendFilter and passesVolumeFilter and passesShortVWAPFilter
+
+//==================================================================================================
+// RISK ENGINE
+// Frozen prices are assigned only when a new confirmed signal occurs.
+//==================================================================================================
+var float frozenEntryPrice = na
+var float frozenStopLoss = na
+var float frozenTargetOne = na
+var float frozenTargetTwo = na
+
+if confirmedLongSignal
+    frozenEntryPrice := close
+    frozenStopLoss := getLongHybridStopLoss(frozenEntryPrice, atrValue, latestConfirmedSwingLow)
+    frozenTargetOne := getLongTargetPrice(frozenEntryPrice, frozenStopLoss, targetOneRiskReward)
+    frozenTargetTwo := getLongTargetPrice(frozenEntryPrice, frozenStopLoss, targetTwoRiskReward)
+else if confirmedShortSignal
+    frozenEntryPrice := close
+    frozenStopLoss := getShortHybridStopLoss(frozenEntryPrice, atrValue, latestConfirmedSwingHigh)
+    frozenTargetOne := getShortTargetPrice(frozenEntryPrice, frozenStopLoss, targetOneRiskReward)
+    frozenTargetTwo := getShortTargetPrice(frozenEntryPrice, frozenStopLoss, targetTwoRiskReward)
+
+//==================================================================================================
+// DRAWING ENGINE
+// Markers use TradingView candle-relative placement. Level objects are created and replaced only
+// on a confirmed signal; their prices and endpoints are never modified on later candles.
+//==================================================================================================
+var line activeEntryLine = na
+var line activeStopLossLine = na
+var line activeTargetOneLine = na
+var line activeTargetTwoLine = na
+
+plotshape(confirmedLongSignal, title = "BUY", style = shape.triangleup, location = location.belowbar, color = color.teal, text = "BUY", textcolor = color.white, size = size.small)
+plotshape(confirmedShortSignal, title = "SELL", style = shape.triangledown, location = location.abovebar, color = color.maroon, text = "SELL", textcolor = color.white, size = size.small)
+
+if confirmedLongSignal or confirmedShortSignal
+    if showTradeLevels
+        deleteActiveTradeLines(activeEntryLine, activeStopLossLine, activeTargetOneLine, activeTargetTwoLine)
+        activeEntryLine := createFrozenTradeLine(bar_index, frozenEntryPrice,  color.blue, 2)
+        activeStopLossLine := createFrozenTradeLine(bar_index, frozenStopLoss, color.red, 2)
+        activeTargetOneLine := createFrozenTradeLine(bar_index, frozenTargetOne, color.green, 1)
+        activeTargetTwoLine := createFrozenTradeLine(bar_index, frozenTargetTwo, color.lime, 2)
+
+//==================================================================================================
+// RETAINED INDICATOR VISUALS
+//==================================================================================================
+plot(
+    showTrendAverage ? trendEma : na,
+    "Trend EMA",
+    color = trendEmaColor,
+    linewidth = 2)
+
+plot(
+    showVWAP ? currentVWAP : na,
+    "VWAP",
+    color = color.blue,
+    linewidth = 2)
+    
+//==================================================================================================
+// ALERT ENGINE
+// Alert titles and message text remain unchanged to preserve existing TradingView alert contracts.
+//==================================================================================================
+alertcondition(confirmedLongSignal, title = "AJ Smart v0.4 Long Setup", message = "AJ Smart v0.4: confirmed bullish setup on {{ticker}} at {{close}}.")
+alertcondition(confirmedShortSignal, title = "AJ Smart v0.4 Short Setup", message = "AJ Smart v0.4: confirmed bearish setup on {{ticker}} at {{close}}.")
+
+    
+//==================================================================================================
+// ALERT ENGINE
+// Alert titles and message text remain unchanged to preserve existing TradingView alert contracts.
+//==================================================================================================
+alertcondition(confirmedLongSignal, title = "AJ Smart v0.4 Long Setup", message = "AJ Smart v0.4: confirmed bullish setup on {{ticker}} at {{close}}.")
+alertcondition(confirmedShortSignal, title = "AJ Smart v0.4 Short Setup", message = "AJ Smart v0.4: confirmed bearish setup on {{ticker}} at {{close}}.")
+
